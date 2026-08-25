@@ -1,0 +1,16 @@
+# Python dependencies for the colour-bot harness.
+#   pip install -r requirements.txt
+#
+# NOTE: pytesseract is only the python wrapper - the Tesseract *binary* has to be
+# installed separately (see the README, "Setting up from a fresh workspace").
+
+numpy>=1.24
+opencv-python>=4.8            # connected components for the colour blob finders
+Pillow>=10.0                  # ImageGrab screen capture
+pytesseract>=0.3.10           # local OCR: chat watchdog + valuable drop label
+
+mouse>=0.7.1                  # human-like moves/clicks (vision driven actions)
+keyboard>=0.13.5              # key presses + the ESC panic key
+pynput>=1.7.6                 # recorded route playback / recording
+
+discord.py>=2.3.0             # Discord control channel
