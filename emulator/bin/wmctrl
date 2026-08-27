@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""
+wmctrl -- the fake window manager query tool.
+=============================================
+
+`core._find_window_linux()` shells out to `wmctrl -lG` and parses the classic
+one-line-per-window format:
+
+    0x03000007  0 60   120  955 680 emulator colour-bot RuneLite - EmuAcct
+    ^id         ^desk ^x   ^y  ^w  ^h  ^host   ^title (rest of the line)
+
+It splits on whitespace with `maxsplit=7`, so the title may contain spaces but
+everything before it may not.  This script answers from the emulator's window
+list, which means the bot discovers the emulated client the same way it would
+discover a real RuneLite window - by asking the window manager where it is.
+
+Pure standard library on purpose: it is spawned as a subprocess and must start
+fast, and it must not drag numpy/opencv in behind it.
+"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))))
+
+from emulator import protocol                                   # noqa: E402
+
+HOST = "emulator"
+
+
+def main(argv):
+    flags = [a for a in argv[1:] if a.startswith("-")]
+    if not flags or "-l" not in "".join(flags):
+        # `wmctrl` with no listing flag prints usage and exits non-zero.
+        sys.stderr.write("wmctrl: no action specified\n")
+        return 1
+
+    try:
+        client = protocol.EmulatorClient()
+        header, _payload = client.request({"op": "windows"})
+    except Exception as exc:                       # emulator not running
+        sys.stderr.write(f"wmctrl: cannot connect to the display: {exc}\n")
+        return 1
+
+    lines = []
+    for index, window in enumerate(header.get("windows", [])):
+        lines.append("0x{:08x}  0 {:<4} {:<4} {:<4} {:<4} {} {}".format(
+            0x03000000 + index, window["x"], window["y"], window["w"],
+            window["h"], HOST, window["title"]))
+    sys.stdout.write("\n".join(lines) + ("\n" if lines else ""))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

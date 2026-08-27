@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""
+tesseract -- the OCR stand-in, speaking the real binary's CLI.
+==============================================================
+
+There is no Tesseract in this environment and no network to install one, but
+the bot's behaviour genuinely depends on OCR: `ChatWatcher` reads the "Press
+Enter to Chat" prompt to decide whether the chat box is covering the screen,
+and `DropFinder` reads ground-item labels to decide whether the pink text under
+the mouse is the item the route is waiting for.  Stubbing that out would delete
+the most configuration-sensitive part of the flow from the test.
+
+So this is a real implementation of the *contract* pytesseract expects:
+
+    tesseract --version                 -> "tesseract 5.3.4" on stdout
+    tesseract INPUT OUTBASE [flags] txt -> writes OUTBASE.txt
+
+The recognition itself happens in the emulator process (`server.LexiconOCR`),
+which re-renders the strings the game can draw through the identical
+dilate/upscale/blur/invert pipeline and compares pixels.  Unreadable input
+gives back an empty string, exactly like the real thing - which is what lets
+`ocr_match_ratio` and `click_unverified_single_label` be exercised for real.
+
+Kept dependency free so `--version` (called on every chat check and every drop
+scan) costs a bare interpreter start instead of an opencv import.
+"""
+
+import os
+import sys
+
+VERSION_BANNER = (
+    "tesseract 5.3.4\n"
+    " leptonica-1.82.0\n"
+    "  libgif 5.2.1 : libjpeg 8d (libjpeg-turbo 2.1.5) : libpng 1.6.43 : "
+    "libtiff 4.5.1 : zlib 1.3 : libwebp 1.3.2\n"
+    " Found AVX2\n"
+    " Found AVX\n"
+    " Found SSE4.1\n"
+)
+
+# flags that swallow the following argument, so it is not mistaken for a path
+VALUE_FLAGS = {"-l", "--psm", "--oem", "--tessdata-dir", "--user-words",
+               "--user-patterns", "-c"}
+# output formats pytesseract appends after the flags
+FORMATS = {"txt", "hocr", "pdf", "tsv", "alto", "box", "osd", "xml"}
+
+
+def parse_args(argv):
+    """Return (input_path, output_base, psm) from a tesseract command line."""
+    positional, psm = [], 7
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg.startswith("-"):
+            flag, _, inline = arg.partition("=")
+            if inline:
+                if flag == "--psm":
+                    psm = int(inline)
+            elif flag in VALUE_FLAGS:
+                index += 1
+                if index < len(argv):
+                    if flag == "--psm":
+                        psm = int(argv[index])
+        elif arg in FORMATS and len(positional) >= 2:
+            pass                                   # the requested output format
+        else:
+            positional.append(arg)
+        index += 1
+    if len(positional) < 2:
+        return None, None, psm
+    return positional[0], positional[1], psm
+
+
+def main(argv):
+    args = argv[1:]
+    if not args or "--version" in args or "-v" in args:
+        sys.stdout.write(VERSION_BANNER)
+        return 0
+    if "--list-langs" in args:
+        sys.stdout.write("List of available languages (1):\neng\n")
+        return 0
+
+    input_path, output_base, psm = parse_args(args)
+    if not input_path or not output_base:
+        sys.stderr.write("Usage: tesseract imagename outputbase [options...]\n")
+        return 1
+    if not os.path.exists(input_path):
+        sys.stderr.write(f"Error: cannot open input file: {input_path}\n")
+        return 1
+
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))))
+    from emulator import protocol
+
+    with open(input_path, "rb") as handle:
+        image = handle.read()
+
+    try:
+        client = protocol.EmulatorClient()
+        header, _payload = client.request({"op": "ocr", "psm": psm}, image)
+    except Exception as exc:
+        sys.stderr.write(f"Error during processing: {exc}\n")
+        return 1
+
+    text = header.get("text", "")
+    with open(f"{output_base}.txt", "w", encoding="utf-8") as handle:
+        handle.write(text + "\n" if text else "\n")
+    # Real tesseract chats about what it is doing on stderr; pytesseract only
+    # looks at stderr when the exit code is non-zero, so this is harmless.
+    sys.stderr.write(f"Estimating resolution as 300\nPage 1 (psm {psm})\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
