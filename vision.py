@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import difflib
 import logging
+import os
 import re
 import threading
 from dataclasses import dataclass
@@ -127,11 +128,21 @@ class Vision:
         img = self.capture() if img is None else img
         mask = color_mask(img, config.COLORS[color_name])
         count, stats = _components(mask)
+
+        min_area = 1000
         best_label, best_area = None, 0
         for label in range(1, count):
             area = int(stats[label, cv2.CC_STAT_AREA])
+            x, y, w, h, _ = stats[label, :5]
+            # Debug print
+            # print(f"blob label={label} area={area} w={int(w)} h={int(h)}")
+            if area < min_area and w < 10 and h < 10: # ignore tiny specks
+                continue
             if area > best_area:                 # strict '>' keeps the first one
                 best_label, best_area = label, area
+        # Debug print
+        # x, y, w, h, _ = stats[best_label, :5]
+        # print(f"best blob bbox=(x={int(x)}, y={int(y)}, w={int(w)}, h={int(h)})")
         if best_label is None:
             LOG.info("No solid %s area found.", color_name)
             return None
@@ -174,6 +185,46 @@ class Vision:
         LOG.info("Largest boxed %s area found at center %s", color_name, region.center)
         return region
 
+    def boxed_regions(self, color: Sequence[int], img: np.ndarray = None,
+                      tolerance: int = None) -> List[Region]:
+        """Every individual hollow *outline* rectangle of a colour.
+
+        Like `largest_boxed`, a pixel counts when it has at least one
+        4-neighbour that is a different colour (i.e. it is part of the outline
+        of a hollow highlight box).  Unlike `largest_boxed` - which merges all
+        outline pixels into ONE bounding box - this runs connected components
+        on the edge pixels and returns each hollow outline rectangle as its own
+        `Region`.  Used to pick out the single tile that a valuable drop sits
+        on (RuneLite's Ground Items draws a pink box around it).
+        """
+        img = self.capture() if img is None else img
+        mask = color_mask(img, color, tolerance).astype(bool)
+        if not mask.any():
+            return []
+
+        # Pixels whose 4 neighbours are all the same colour are interior
+        # pixels.  Padding with True makes out-of-image neighbours count as
+        # "same colour", matching the original boxed-region behaviour.
+        padded = np.pad(mask, 1, constant_values=True)
+        interior = (padded[1:-1, 1:-1] & padded[:-2, 1:-1] & padded[2:, 1:-1]
+                    & padded[1:-1, :-2] & padded[1:-1, 2:])
+        edges = (mask & ~interior).astype(np.uint8)
+        if not edges.any():
+            return []
+
+        count, _labels, stats, _cent = cv2.connectedComponentsWithStats(
+            edges, connectivity=4)
+        regions: List[Region] = []
+        for label in range(1, count):
+            x, y, w, h, area = (int(v) for v in stats[label, :5])
+            region = Region(name=f"boxed outline",
+                            center=(x + w // 2, y + h // 2),
+                            x_bounds=(x, x + w - 1),
+                            y_bounds=(y, y + h - 1),
+                            area=area)
+            regions.append(region)
+        return regions
+
     def equal_largest_solids(self, color_name: str, img: np.ndarray = None,
                              tolerance: float = None) -> List[Region]:
         """All blobs at least `tolerance` as big as the biggest one.
@@ -189,13 +240,69 @@ class Vision:
         if count <= 1:
             LOG.info("No solid %s areas found.", color_name)
             return []
-        areas = [int(stats[label, cv2.CC_STAT_AREA]) for label in range(1, count)]
-        threshold = max(areas) * tolerance
+        min_area = 100
+        filtered = []
+        for label in range(1, count):
+            area = int(stats[label, cv2.CC_STAT_AREA])
+            w, h = int(stats[label, cv2.CC_STAT_WIDTH]), int(stats[label, cv2.CC_STAT_HEIGHT])
+            if area < min_area and w < 5 and h < 5:
+                continue
+            filtered.append((label, area))
+        if not filtered:
+            LOG.info("No solid %s areas found.", color_name)
+            return []
+        threshold = max(a for _, a in filtered) * tolerance
         regions = [_region_from_stats(f"solid {color_name}", stats[label])
-                   for label, area in zip(range(1, count), areas)
+                   for label, area in filtered
                    if area >= threshold]
         LOG.info("Found %d approximately equal largest solid %s areas.",
                  len(regions), color_name)
+        return regions
+
+    # -- template matching --------------------------------------------------
+    def match_templates_any(self, template_paths: Sequence[str],
+                            img: np.ndarray = None,
+                            threshold: float = 0.6) -> List[Region]:
+        """All distinct matches of ANY of the templates above `threshold`.
+
+        Several templates can describe the same kind of thing (the four
+        ancient brew dose counts): every candidate from every template goes
+        into ONE non-max-suppression pass sorted by score descending, so an
+        inventory slot matched by two variants keeps only its better hit.
+        """
+        img = self.capture() if img is None else img
+        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+        candidates = []
+        for template_path in template_paths:
+            template = cv2.imread(template_path, cv2.IMREAD_COLOR)
+            if template is None:
+                LOG.error("could not load template image: %s", template_path)
+                continue
+            result = cv2.matchTemplate(img_bgr, template, cv2.TM_CCOEFF_NORMED)
+            th, tw = template.shape[:2]
+            ys, xs = np.nonzero(result >= threshold)
+            for score, row, col in zip(result[ys, xs], ys, xs):
+                candidates.append((float(score), int(col), int(row), tw, th,
+                                   os.path.basename(template_path)))
+        if not candidates:
+            LOG.info("no matches above %.2f from %d template(s)",
+                     threshold, len(template_paths))
+            return []
+
+        kept: List[Tuple[int, int, int, int, str]] = []
+        for score, x, y, tw, th, base in sorted(candidates, reverse=True):
+            if all(abs(x - kx) > tw // 2 or abs(y - ky) > th // 2
+                   for kx, ky, _, _, _ in kept):
+                kept.append((x, y, tw, th, base))
+
+        regions = [Region(name=f"template {base}",
+                          center=(x + tw // 2, y + th // 2),
+                          x_bounds=(x, x + tw - 1),
+                          y_bounds=(y, y + th - 1))
+                   for x, y, tw, th, base in kept]
+        LOG.info("found %d match(es) above %.2f from %d template(s)",
+                 len(regions), threshold, len(template_paths))
         return regions
 
     # -- debugging ---------------------------------------------------------
@@ -363,7 +470,7 @@ class ChatWatcher:
                     LOG.info("chat closed after %d '%s' press(es)", attempt,
                              self.cfg["toggle_key"])
                     return True
-
+            """
             # Fallback: the 'All' button does exactly the same as the '`' key.
             LOG.warning("chat still open - falling back to the 'All' button")
             rect = Rect(*self.cfg["all_button_rect"])
@@ -375,6 +482,9 @@ class ChatWatcher:
                 LOG.info("chat closed by the 'All' button")
                 return True
             LOG.error("could not close the chat window - detection may suffer")
+            return False
+            """
+            LOG.warning("chat still open - skipping 'All' button fallback")
             return False
 
     # -- background guard --------------------------------------------------
@@ -432,15 +542,38 @@ class DropFinder:
 
     The old implementation clicked a fixed magenta box that RuneLite paints on
     the player's own tile - which only works while the player never moves.  We
-    instead look for the ground-item label the Ground Items plugin paints in its
-    highlight colour, confirm the item name with local OCR and click the pile
-    itself.
+    instead look for the hollow outline box RuneLite's Ground Items plugin draws
+    around the tile the drop sits on (same pink highlight colour as the text
+    label, but the box - unlike the text - is not covered by the red monster
+    highlight).  That outline gives us *where* the drop is.  The OCR'd text
+    label is used separately to *confirm* the pickup (the specific item name).
     """
 
     def __init__(self, vision: Vision, item_name: str, cfg: dict = None):
         self.vision = vision
         self.item_name = item_name
         self.cfg = cfg or config.DROP
+
+    def find_drop_by_outline(self, img: np.ndarray = None) -> Optional[Region]:
+        """The hollow highlight box around the drop's tile, or None.
+
+        Primary detector for *where* the drop is: it does not depend on the
+        text label, which the red monster highlight can cover.  Returns the
+        largest outline that fits a single tile's on-screen rectangle.
+        """
+        cfg = self.cfg
+        boxes = self.vision.boxed_regions(cfg["outline_color"], img,
+                                          tolerance=cfg["outline_tolerance"])
+        good = [r for r in boxes
+                if (cfg["outline_min_w"] <= r.rect.w <= cfg["outline_max_w"]
+                    and cfg["outline_min_h"] <= r.rect.h <= cfg["outline_max_h"])]
+        if not good:
+            LOG.info("no drop tile outline found (%d boxed region(s) seen)",
+                     len(boxes))
+            return None
+        best = max(good, key=lambda r: r.area)
+        LOG.info("drop tile outline at %s", best)
+        return best
 
     def find_labels(self, img: np.ndarray = None) -> List[GroundLabel]:
         """Every highlight-coloured text line currently on the canvas."""
@@ -477,7 +610,12 @@ class DropFinder:
         return labels
 
     def find_drop(self, img: np.ndarray = None) -> Optional[GroundLabel]:
-        """The label that belongs to our valuable drop, or None."""
+        """The OCR-confirmed ground label for our item, or None.
+
+        This is the *confirmation* path, not the click-target search: it reads
+        the text label and confirms it matches `item_name` (see
+        `find_drop_by_outline` for the primary "where is the drop" detector).
+        """
         labels = self.find_labels(img)
         if not labels:
             return None

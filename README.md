@@ -51,12 +51,7 @@ python main.py --route route1 --start common          :: skip the route replay (
 python main.py --route route1 --debug-drop            :: TEST THE VALUABLE-DROP PICK-UP
 python main.py --route route2 --debug-drop --skip-inventory-clear
 python main.py --record routes/route1_leg1.json       :: record a new leg (ESC stops)
-python test_emulator_flow.py                          :: TEST THE WHOLE FLOW, no game client needed
 ```
-
-`test_emulator_flow.py` runs this exact script against an emulated game client
-and an emulated Discord, both on screen, and checks the whole flow end to end.
-It is the baseline test for this codebase - see **[EMULATOR.md](EMULATOR.md)**.
 
 **Discord commands** (prefix `!`): `!kill` `!restart` `!screenshot` `!count`
 `!plus [n]` `!minus [n]` `!reset` `!status` `!runtime` `!routes`
@@ -125,8 +120,6 @@ main.py --route route1
 | `requirements.txt` | python dependencies |
 | `runtime_total.json` | created at runtime: the persistent stopwatch |
 | `colourbot.log` | created at runtime: rolling console log copy |
-| `test_emulator_flow.py` | the test: runs `main.py --route route1` against an emulated game client + Discord - see [EMULATOR.md](EMULATOR.md) |
-| `emulator/` | that emulator (nothing here is imported by the bot) |
 
 Old entry points map like this:
 
@@ -605,8 +598,6 @@ and a fresh brew counter, exactly like a fresh process had).
 * The loot-spam panic check keeps its off-by-two (`recent_window` 6 vs
   `loot_spam_threshold` 8 means it never fires). Set the window to 8 in
   `config.DISCORD` if you want it live.
-* `no_orange` ("out of brews") still only acts when the *next* line arrives in
-  the Discord channel, like the original.
 * The three input libraries are still used for the same things
   (`keyboard` for key presses, `mouse` for vision-driven clicks, `pynput` for
   recorded playback) - for anti-cheat work *how* input is injected matters.

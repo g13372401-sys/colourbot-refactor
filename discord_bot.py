@@ -16,7 +16,7 @@ Two jobs, cleanly separated:
        they come from the game, not from a human - and they drive the flags the
        automation threads watch.  The wording lives in config.DISCORD["messages"].
 
-The service owns nothing about the game itself: it talks to `AutomationState`
+The service owns nothing about the game itself: it talks to `BotState`
 (flags/counters) and to a small `BotContext` that main.py keeps up to date with
 the currently active route and input controller.  That is what lets the bot come
 up *before* the first route is replayed and stay up for the whole life of the
@@ -35,6 +35,7 @@ from typing import Optional
 
 import config
 import core
+import inputbackends
 
 LOG = logging.getLogger("colourbot.discord")
 
@@ -60,7 +61,7 @@ class BotContext:
     session starts, so the commands always act on the current run.
     """
 
-    def __init__(self, state: core.AutomationState, clock: core.Clock,
+    def __init__(self, state: core.BotState, clock: core.Clock,
                  timer: core.RuntimeTimer):
         self.state = state
         self.clock = clock
@@ -83,6 +84,8 @@ class DiscordService:
         self._thread: Optional[threading.Thread] = None
         self._last_channel = None
         self._user = None
+        self._last_message = None
+        self._cant_reach_count = 0
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -143,6 +146,19 @@ class DiscordService:
                 return channel
         return self._last_channel
 
+    def notify_dm(self, text: str) -> None:
+        if self.loop is None:
+            return
+        asyncio.run_coroutine_threadsafe(self._dm_user(text), self.loop)
+        
+    async def _dm_user(self, text: str):
+        try:
+            if self._user is not None:
+                await self._user.create_dm()
+                await self._user.dm_channel.send(text)
+        except Exception as exc:
+            LOG.warning("could not DM the operator: %s", exc)
+
     def notify(self, text: str) -> None:
         """Fire-and-forget message into the control channel."""
         if self.bot is None or self.loop is None:
@@ -188,11 +204,12 @@ class DiscordService:
             # Mailbox bookkeeping first - the legacy code did this even for the
             # bot's own messages, and the watcher thread relies on the order.
             state.record_message(content)
-
+            """
             msgs = cfg["messages"]
-            if state.recent_count(msgs["loot_full"]) == cfg["loot_spam_threshold"]:
+            if state.recent_count(msgs["invent_full"]) == cfg["loot_spam_threshold"]:
                 await message.channel.send("@everyone coin pouch error!")
                 self._hard_exit("coin pouch error")
+            """
 
             if message.author == bot.user:
                 return
@@ -207,8 +224,10 @@ class DiscordService:
         """Relayed game chat -> automation flags.  Order matches the original."""
         cfg, state = self.cfg, self.state
         msgs = cfg["messages"]
+        previous_message = self._last_message
         content = message.content
-
+        self._last_message = message.content
+        
         # --- death: nothing to salvage, stop everything -------------------
         if msgs["death_substring"].lower() in content.lower():
             await message.channel.send("@everyone dead lmao")
@@ -222,41 +241,54 @@ class DiscordService:
             await self._wait("discord.before_restart")
             state.request_restart("low hp relay message")
             return
+        
+        # --- bot stuck outside door: restart if threshold reached ---------
+        if content == msgs["cant_reach"]:
+            #await message.channel.send("Can't reach red message received")
+            await self._wait("discord.before_restart")
+            LOG.info("Cant reach red message received: %r", content)
+            LOG.info("Previous message: %r", previous_message)
+            if previous_message == content:
+                print(cfg["cant_reach_thresh"])
+                if self._cant_reach_count == cfg["cant_reach_thresh"]:
+                    LOG.error("'cant reach' message threshold hit. Restarting")
+                    await message.channel.send("@everyone repeated 'cant reach'. Restarting")
+                    self._cant_reach_count = 0
+                    state.request_restart("cant reach relay message")
+                else:
+                    self._cant_reach_count += 1
+                    LOG.warning("Repeated 'cant reach' message received. Incrementing count: %d/%d", 
+                                self._cant_reach_count, cfg["cant_reach_thresh"])
+            return
 
         # --- valuable drop broadcast -> arm the pick-up routine -----------
         keyword = self._drop_keyword()
         if keyword and keyword.lower() in content.lower():
             state.valuable_drop = True
+            drop_name = self.ctx.route.drop_item_name
             LOG.warning("valuable drop broadcast detected: %r", content)
-            await message.channel.send("@everyone VALUEABLE DROP !!!")
+            await message.channel.send(f"@everyone {drop_name}")
             await message.channel.send(f"{message.author.name} said: '{content}'")
+            await self._dm_user(f"{drop_name} received")
+            """
             try:
                 if self._user is not None:
                     await self._user.create_dm()
-                    await self._user.dm_channel.send("VALUEABLE DROP !!!")
+                    await self._user.dm_channel.send(f"{drop_name} received")
             except Exception as exc:
                 LOG.warning("could not DM the operator: %s", exc)
+            """
 
         # --- somebody/something asked about hitpoints --------------------
         if msgs["brew_query_substring"].lower() in content.lower():
             await self._wait("discord.before_brew_reply")
             await message.channel.send("brew_counter: " + str(state.brew_counter))
 
-        # --- no brews left ------------------------------------------------
-        # Legacy quirk kept on purpose: `no_orange` is raised by the automation
-        # thread but only *acted on* when the next line arrives in the channel.
-        if state.no_orange:
-            await message.channel.send("@everyone program finished.")
-            await message.channel.send("total runtime: " + self.ctx.timer.formatted())
-            LOG.warning("Program finished (out of brews).")
-            await self._wait("discord.before_restart")
-            state.request_restart("out of brews")
-            return
-
         if state.program_finished:
             await message.channel.send("@everyone program finished.")
             await message.channel.send("total runtime: " + self.ctx.timer.formatted())
             self._hard_exit("program finished")
+
 
     async def _wait(self, delay_name: str) -> None:
         """Sleep in a worker thread; a pending kill/restart just skips the wait."""
@@ -287,14 +319,14 @@ class DiscordService:
             return False
 
         # -- process control ------------------------------------------------
-        @bot.command(name="kill", aliases=["stop", "quit"],
+        @bot.command(name="kill", aliases=["stop", "quit", "q"],
                      help="Stop the script immediately.")
         async def kill_cmd(command_ctx):
             await command_ctx.send("killing program. total runtime: "
                                    + ctx.timer.formatted())
             self._hard_exit("!kill")
 
-        @bot.command(name="restart", aliases=["reboot"],
+        @bot.command(name="restart", aliases=["reboot", "r"],
                      help="Restart the flow from the top, same configuration.")
         async def restart_cmd(command_ctx):
             await command_ctx.send(
@@ -302,7 +334,7 @@ class DiscordService:
                 f"(runtime keeps counting: {ctx.timer.formatted()})")
             state.request_restart("!restart")
 
-        @bot.command(name="screenshot", aliases=["screen", "shot"],
+        @bot.command(name="screenshot", aliases=["screen", "s"],
                      help="Press the in-game screenshot hotkey (insert).")
         async def screenshot_cmd(command_ctx):
             await asyncio.to_thread(self._tap_screenshot_key)
@@ -389,13 +421,16 @@ class DiscordService:
             controller.tap("insert", hold="discord.screenshot_hold",
                            note="Discord !screenshot")
             return
-        if core.keyboard_lib is None:
-            LOG.warning("keyboard module missing - cannot send the screenshot key")
+        try:
+            backend = inputbackends.get_backend()
+        except inputbackends.BackendUnavailable as exc:
+            LOG.warning("no input backend - cannot send the screenshot key: %s",
+                        exc)
             return
-        core.keyboard_lib.press("insert")
+        backend.key_down("insert")
         self.ctx.clock.sleep(core.sample_delay(
             config.DELAYS["discord.screenshot_hold"]))
-        core.keyboard_lib.release("insert")
+        backend.key_up("insert")
 
     @staticmethod
     def _run_shell(command_line: str) -> str:

@@ -12,6 +12,7 @@ This is the ONLY file you should need to touch for day to day tweaking:
     * where the game window is / how it is found   -> GAME_WINDOW
     * valuable drop pick-up behaviour              -> DROP
     * chat-window watchdog                         -> CHAT
+    * HOW input is injected (anti-cheat!)          -> INPUT
 
 Nothing in here imports the rest of the project, so it can never create an
 import cycle and you can `python -c "import config"` to syntax check it.
@@ -35,8 +36,32 @@ unique sleep statement kept its own entry (and therefore its own random
 distribution).  Renaming/retiming a step is now a one line change.
 """
 
+import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence
+
+# Load secrets from a local .env file (see .env.example).  Variables that are
+# already present in the real environment win over the file.  python-dotenv is
+# in requirements.txt; if it is missing the bot still runs as long as every
+# secret is exported into the environment the normal way.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+
+def _env(name: str) -> str:
+    """Read a required-ish setting from the environment ('' when absent)."""
+    return os.environ.get(name, "")
+
+
+def _env_int(name: str, default: int = 0) -> int:
+    raw = _env(name)
+    try:
+        return int(raw)
+    except ValueError:
+        return default
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +119,20 @@ class ClickLargestSolid:
     color: str
     what: str
     optional: bool = True
+
+
+@dataclass(frozen=True)
+class ClickTemplateMatch:
+    """Find every match of a template image and click one at random.
+
+    `template` is a path relative to this script's directory (resolved by
+    main.resolve_path).  `optional=True` skips the step with a warning when
+    nothing matches.
+    """
+    template: str
+    what: str
+    optional: bool = True
+    threshold: float = 0.6
 
 
 @dataclass(frozen=True)
@@ -265,7 +304,7 @@ VISION = {
     # faster and react to target movement much sooner than the original.  The
     # explicit interval below keeps the original cadence; set it to 0.0 if you
     # *want* the faster reactions.
-    "scan_interval_seconds": 0.8,
+    "scan_interval_seconds": 0.2,
 
     # Poll interval of the Discord-message watcher thread.  The legacy loop was
     # a busy spin (100% of a core); 10 ms costs nothing and is invisible in game.
@@ -274,7 +313,23 @@ VISION = {
     # Tolerance used when grouping "all roughly equally large blobs" (brews,
     # necklaces).  0.9 = keep everything at least 90% as big as the biggest.
     "equal_region_tolerance": 0.9,
+
+    # Template match score for the ancient brew doses.  Stricter than the
+    # 0.6 default because the four dose variants differ only in the digit.
+    "brew_match_threshold": 0.8,
 }
+
+# Templates that all mean "an ancient brew dose, whatever is left of it".
+# When none of them matches any more, only vials are left -> out of brews.
+BREW_TEMPLATES: List[str] = [
+    "images/Ancient_brew(4).webp",
+    "images/Ancient_brew(3).webp",
+    "images/Ancient_brew(2).webp",
+    "images/Ancient_brew(1).webp",
+]
+
+# The coin pouch (clicked to empty it); there is at most one on screen.
+COIN_POUCH_TEMPLATE = "images/Coin_pouch_(elf).webp"
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +352,62 @@ MOUSE = {
 
 
 # ---------------------------------------------------------------------------
+# 7b. INPUT -- how mouse/keyboard events reach the operating system
+# ---------------------------------------------------------------------------
+# This is the anti-cheat relevant knob.  The *movement* above says where the
+# pointer goes; this says HOW the event enters Windows, which decides whether
+# the game's low level hook sees LLMHF_INJECTED / LLMHF_LOWER_IL_INJECTED in
+# MSLLHOOKSTRUCT.flags.  Full background: INPUT_INJECTION.md.
+#
+#   "interception"  kernel filter driver on the mouse/keyboard class stacks.
+#                   Software only.  Events come out of the device stack, so
+#                   NO injected flags.  Needs the Interception driver
+#                   installed once (install-interception.exe /install + reboot).
+#   "arduino"       a real USB HID board driven over serial.  The events *are*
+#                   hardware, so no flags and no driver to find.  Needs the
+#                   board + firmware/hid_relay/hid_relay.ino.
+#   "sendinput"     the legacy mouse/keyboard/pynput path.  SETS the flags -
+#                   fallback and test control only.
+#   "auto"          first entry of auto_order that starts successfully.
+
+INPUT = {
+    "backend": "auto",                    # auto | interception | arduino | sendinput
+    "auto_order": ["interception", "arduino", "sendinput"],
+
+    # Set this to False on a live account: "auto" then refuses to fall back to
+    # the detectable SendInput path and the run stops with a clear error
+    # instead of quietly emulating input the flagged way.
+    "allow_flagged_fallback": True,
+
+    "interception": {
+        # None -> look for interception.dll next to main.py, on PATH, in
+        # %INTERCEPTION_DLL% and in the usual install folders.
+        "dll": None,
+        # None -> first keyboard (1..10) / mouse (11..20) that reports a
+        # hardware id, i.e. a device that is really plugged in.
+        "keyboard_device": None,
+        "mouse_device": None,
+        # "relative" sends the same packets a real mouse sends and steers to the
+        # target in a closed loop (GetCursorPos).  "absolute" is exact but looks
+        # like a graphics tablet on the wire.
+        "move_mode": "relative",
+        "closed_loop_iterations": 8,
+        "settle_seconds": 0.001,          # let the driver deliver before re-reading
+    },
+
+    "arduino": {
+        "port": None,                     # None = autodetect, else e.g. "COM5"
+        "baud": 115200,
+        "timeout": 1.0,
+        "wait_for_ack": True,             # board answers "K" per command
+        "closed_loop_iterations": 12,     # HID deltas are capped at +/-127 px
+        "settle_seconds": 0.002,
+        "reset_delay": 1.6,               # 32u4 boards reboot when the port opens
+    },
+}
+
+
+# ---------------------------------------------------------------------------
 # 8. DELAYS -- the single timing table
 # ---------------------------------------------------------------------------
 # Naming scheme: "<phase>.<what it waits for>".
@@ -305,6 +416,7 @@ MOUSE = {
 DELAYS: Dict[str, object] = {
     # -- route replay phase (was replay.py) --------------------------------
     "route.start_pause":          Fixed(1.0),        # before anything happens
+    "route.home_tab_delay":       Fixed(5.0),
     "leg.initial_pause":          Fixed(1.0),        # start of every leg
     "leg.tab_key_hold":           Uniform(0.1, 0.5), # '2' (inventory tab) hold time
     "leg.after_tab_key":          Fixed(1.0),
@@ -325,10 +437,10 @@ DELAYS: Dict[str, object] = {
 
     # -- common case: clicking the red target (was redclick.py) ------------
     "common.after_target_click":  Uniform(0.1, 0.3),
-    "common.idle_click.interval": Uniform(0.2, 0.4),
+    "common.idle_click.interval": Uniform(0.15, 0.3),
     "common.idle_click.pause":    Uniform(1.1, 1.4), # the occasional "afk" hitch
     "common.after_smite":         Uniform(0.0, 0.5),
-    "common.after_loot_full":     Uniform(0.5, 0.8),
+    "common.after_invent_full":     Uniform(0.5, 0.8),
     "common.after_dodgy_gone":    Uniform(0.0, 0.5),
     "common.after_veil_gone":     Uniform(0.0, 0.5),
 
@@ -339,6 +451,10 @@ DELAYS: Dict[str, object] = {
 
     # -- following the target when it wandered off -------------------------
     "target.settle":              Fixed(2.0),
+
+    # -- human-like left click (press -> hold -> release) ------------------
+    # ~80 ms +/- 20 ms button-down time, typical for a human click
+    "mouse.click_hold":           Gauss(0.08, 0.02),
 
     # -- inventory full: empty the pouch and shift-drop a junk item --------
     "invent.before_pouch_click":  Uniform(1.0, 2.0),
@@ -360,11 +476,12 @@ DELAYS: Dict[str, object] = {
     "veil.after_tab_key":         Uniform(0.4, 0.8),
 
     # -- valuable drop ------------------------------------------------------
+    "drop.between_screenshots":   Uniform(2.5, 3.0),
     "drop.before_screenshot":     Uniform(0.1, 0.5),
     "drop.screenshot_hold":       Uniform(0.1, 0.5),
     "drop.after_screenshot":      Uniform(1.0, 2.0),
     "drop.shift_settle":          Uniform(0.1, 0.5),
-    "drop.between_drops":         Uniform(0.1, 0.5),
+    "drop.between_drops":         Uniform(0.8, 1.2),
     "drop.after_drops":           Uniform(0.3, 0.8),
     # NEW: the player (and the camera, which lags behind it) needs ~3 s to come
     # to a full stop after a walk-there click before the next OCR scan is sane.
@@ -373,7 +490,7 @@ DELAYS: Dict[str, object] = {
     "drop.before_final_screenshot": Uniform(1.0, 2.0),
     "drop.final_screenshot_hold": Uniform(0.1, 0.5),
     "drop.after_final_screenshot": Uniform(0.1, 0.5),
-    "drop.before_restart":        Uniform(5.0, 10.0),
+    "drop.before_restart":        Uniform(5.0, 300.0),
 
     # -- chat watchdog (NEW) ------------------------------------------------
     "chat.key_hold":              Uniform(0.05, 0.12),  # '`' hold time
@@ -400,10 +517,13 @@ SEQUENCES: Dict[str, List[object]] = {
         Wait("leg.initial_pause"),
         TapKey("2", hold="leg.tab_key_hold", after="leg.after_tab_key",
                note="inventory tab"),
-        ClickLargestSolid("cyan", "coin pouch"),
+        ClickTemplateMatch(COIN_POUCH_TEMPLATE, "coin pouch", threshold=0.6),
         Wait("leg.after_pouch_click"),
-        ClickLargestSolid("white", "dodgy necklace"),
+        ClickTemplateMatch("images/Dodgy_necklace.webp", "dodgy necklace", threshold=0.6),
         Wait("leg.after_necklace_click"),
+        Wait("route.start_pause"),
+        ClickTemplateMatch("images/house_tab.png", "home tab", threshold=0.6),
+        Wait("route.home_tab_delay"),
     ],
 
     # Runs after the recorded events of a leg finished.
@@ -444,7 +564,7 @@ SEQUENCES: Dict[str, List[object]] = {
 ROUTES: Dict[str, RouteProfile] = {
     "route1": RouteProfile(
         description="Two-leg route: bank/gear prep, teleport hop, then travel to the spot.",
-        legs=["routes/route1_leg1.json", "routes/route1_leg2.json"],
+        legs=["routes/route1_leg1.json"],
         preamble="leg_preamble",
         between_legs="teleport_hop",
         after_last_leg="arrive_at_spot",
@@ -461,8 +581,8 @@ ROUTES: Dict[str, RouteProfile] = {
         # TODO(route2): set these to whatever this route's valuable drop is.
         #   drop_keyword   -> substring of the Discord broadcast line
         #   drop_item_name -> the ground label the OCR should look for
-        drop_keyword="teleport",
-        drop_item_name="Enhanced crystal teleport seed",
+        drop_keyword="shard",
+        drop_item_name="Blood shard",
         expected_drops=2,
     ),
 }
@@ -475,12 +595,14 @@ DEFAULT_ROUTE = "route1"
 # ---------------------------------------------------------------------------
 
 DISCORD = {
-    # === PUT YOUR CREDENTIALS HERE ===================================
-    "token": "BOT_TOKEN_PLACEHOLDER",     # Discord Developer Portal -> Bot -> Token
-    "user_id": 000000000000000000,        # your account id, used for the DM ping
+    # === SECRETS LIVE IN .env ========================================
+    # Create a .env file next to this script (copy .env.example) containing:
+    #   DISCORD_TOKEN=...      Discord Developer Portal -> Bot -> Token
+    #   DISCORD_USER_ID=...    your account id, used for the DM ping
+    # Plain environment variables of the same names work too.
+    "token": _env("DISCORD_TOKEN"),
+    "user_id": _env_int("DISCORD_USER_ID", 0),
     # =================================================================
-    # Both can also be supplied through the environment, which is nicer than
-    # editing a tracked file:  COLOURBOT_DISCORD_TOKEN / COLOURBOT_DISCORD_USER_ID
 
     # Channel the bot posts to on its own initiative (crash notices, "session
     # finished", ...).  0 = just reply in whatever channel last saw traffic.
@@ -500,21 +622,22 @@ DISCORD = {
     # Game chat lines the RuneLite Discord relay posts, and what they mean.
     # Change these if you re-word the relay filters.
     "messages": {
-        "loot_full": "There is no space for your loot!",
+        "invent_full": "There is no space for your loot!",
         "smited": "smited!",
         "dodgy_gone": "Your dodgy necklace has crumbled to dust.",
         "veil_gone": "Shadow Veil has faded!",
         "low_hp": "5 hitpoints!",
         "death_substring": "died",
         "brew_query_substring": "hitpoints",
+        "cant_reach": "I can't reach that!",
     },
-
+    "cant_reach_thresh": 3,
     # Legacy quirk, preserved on purpose: the script watches the last N relayed
-    # lines and panics when "loot_full" shows up `loot_spam_threshold` times.
+    # lines and panics when "invent_full" shows up `loot_spam_threshold` times.
     # With window 6 and threshold 8 it can never actually fire - the original
     # had the same off-by-two.  Set the window to 8 to make it live.
-    "recent_window": 6,
-    "loot_spam_threshold": 8,
+    #"recent_window": 6,
+    #"loot_spam_threshold": 8,
 }
 
 
@@ -541,7 +664,7 @@ COMMON = {
 # taken from the reference layout.
 
 CHAT = {
-    "enabled": True,
+    "enabled": False,
     "check_interval_seconds": 15.0,   # watchdog cadence during the common case
     "run_during_replay": False,       # the replay phase is short; leave it alone
 
@@ -580,6 +703,18 @@ DROP = {
     "label_color": (255, 102, 178),
     "label_tolerance": 40,
 
+    # RuneLite also draws a hollow outline box around the tile the drop sits on,
+    # in the SAME highlight colour (0xFFFFFF66B2 == (255, 102, 178)).  Unlike the
+    # text label, this tile outline survives the red monster highlight, so it is
+    # our *primary* "where is the drop" detector.  A single tile projects to a
+    # small rectangle on screen, so we size-filter to reject specks and HUD.
+    "outline_color": (255, 102, 178),
+    "outline_tolerance": 40,
+    "outline_min_w": 15,
+    "outline_min_h": 8,
+    "outline_max_w": 200,
+    "outline_max_h": 100,
+
     # Glyphs are grouped into one label with this dilation kernel (w, h).
     "line_kernel": (15, 3),
     "min_label_pixels": 40,           # ignore specks
@@ -589,20 +724,73 @@ DROP = {
     # The label is drawn centred on the pile; the sprite itself sits a few
     # pixels lower.  (Measured: label centre y 697, sprite centre y 702.)
     "click_offset_y": 5,
+    # Click offset for the *outline*-based detector.  The outline's bounding-box
+    # centre projects slightly BELOW the tile's clickable centre under the game
+    # camera (the pick-up clickbox hugs the tile's upper region), while being
+    # horizontally spot-on.  Negative = click above the box centre, onto the
+    # item sprite.  Tune this if the cursor visibly lands off-centre in
+    # --debug-drop.
+    "tile_click_offset_y": -14,
     "click_jitter_px": 3,
 
     # OCR verification.
     "ocr_enabled": True,
     "ocr_upscale": 3,                 # tesseract likes big glyphs
     "ocr_dilate": True,               # thicken the thin RS font
-    "ocr_match_ratio": 0.62,          # difflib ratio against drop_item_name
+    "ocr_match_ratio": 0.5,          # difflib ratio against drop_item_name
     # If OCR cannot confirm the name but exactly one label is on screen, still
     # click it (better a wasted click than a lost 6M gp drop).
     "click_unverified_single_label": True,
 
     # Attempt budget: one click per item + one spare scan.
-    "extra_attempts": 1,
+    "extra_attempts": 10,
+    "extra_attempts_warn": 5,
     # Number of scans before giving up on the very first label (the loot beam
     # animation and the camera drift can hide it for a moment).
     "initial_scan_retries": 3,
+
+    # Final confirmation: BOTH the pink tile outline AND the OCR text label
+    # must be gone on `confirm_scans` *consecutive* settled scans.  The red
+    # monster blob is smaller than the tile, so a frame it is mid-move on can
+    # transiently cover part of the outline but a settled frame never will -
+    # which means a single "gone" frame is not trusted.  If the outline shows
+    # back up, the drop is still there and the pick-up resumes clicking.
+    # `confirm_max_scans` bounds how long we keep waiting while (bizarrely) the
+    # OCR label alone refuses to disappear.
+    "confirm_scans": 2,
+    "confirm_max_scans": 5,
+}
+
+
+# ---------------------------------------------------------------------------
+# 14. AI agent -- stuck-state recovery (NEW)
+# ---------------------------------------------------------------------------
+# When the bot gets stuck (no progress for N seconds), an LLM can look at the
+# screen state and choose a recovery action.  Supports OpenAI (GPT-4o) and
+# Google Gemini.  Only one provider needs to be configured.
+#
+# API keys can also be set via environment variables:
+#   OPENAI_API_KEY          for OpenAI
+#   GEMINI_API_KEY          for Gemini
+
+AI_AGENT = {
+    "enabled": False,                   # flip to True to activate
+    "provider": "gemini",               # "openai" or "gemini"
+
+    # -- OpenAI settings ----------------------------------------------------
+    "openai_model": "gpt-4o",
+    # "openai_api_key" is read from OPENAI_API_KEY env var if not set here.
+
+    # -- Gemini settings ----------------------------------------------------
+    "gemini_model": "gemini-3.6-flash",
+    # Key comes from GEMINI_API_KEY in .env (or the environment).
+    "gemini_api_key": _env("GEMINI_API_KEY"),
+    # -- Stuck detection ----------------------------------------------------
+    "stuck_timeout_seconds": 60.0,      # no activity for this long -> stuck
+    "max_consecutive_interventions": 5, # escalate after this many in a row
+    "max_tool_rounds": 5,              # LLM tool calls per intervention
+
+    # -- Fallback -----------------------------------------------------------
+    # If the AI agent fails or is disabled, the bot falls back to the existing
+    # supervisor restart after restart_backoff_seconds (config.GENERAL).
 }

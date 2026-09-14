@@ -7,7 +7,7 @@ Five independent bits live in here, in this order:
     1. logging + control-flow exceptions
     2. RuntimeTimer  - the persistent "how long have we been alive" stopwatch
     3. Clock         - the ONE place the program is allowed to sleep
-    4. AutomationState - flags/counters shared between the worker threads and
+    4. BotState - flags/counters shared between the worker threads and
                          the Discord bot (these were global variables before)
     5. Geometry + InputController - game-window aware coordinates, human-like
                          mouse movement, key taps and recorded-timeline playback
@@ -33,6 +33,8 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import config
+import inputbackends
+from inputbackends import keymap as _keymap
 
 LOG = logging.getLogger("colourbot.core")
 
@@ -227,7 +229,7 @@ class Clock:
     !kill / !restart takes effect immediately instead of after the sleep.
     """
 
-    def __init__(self, state: "AutomationState", delays: Dict[str, object] = None):
+    def __init__(self, state: "BotState", delays: Dict[str, object] = None):
         self.state = state
         self.delays = delays if delays is not None else config.DELAYS
 
@@ -263,7 +265,7 @@ class Clock:
 # 4. Shared state (the old pile of module level globals)
 # ===========================================================================
 
-class AutomationState:
+class BotState:
     """Flags, counters and the relayed-chat mailbox.
 
     The legacy scripts used ~12 global variables that three threads poked at.
@@ -276,7 +278,7 @@ class AutomationState:
 
         # -- interruption ---------------------------------------------------
         self.interrupt = threading.Event()   # set for kill *or* restart
-        self._pending: Optional[str] = None  # "kill" | "restart"
+        self.pending_actions: Optional[str] = None  # "kill" | "restart"
 
         # -- what the bot is doing (for !status) ----------------------------
         self.phase = "starting"
@@ -285,10 +287,12 @@ class AutomationState:
 
         # -- relayed game chat ---------------------------------------------
         self.messages: List[str] = []
-        self.recent = deque([], maxlen=config.DISCORD["recent_window"])
+        #self.recent = deque([], maxlen=config.DISCORD["recent_window"]) # Need to deprecate
 
         # -- automation flags ----------------------------------------------
         self.brew_counter = 0
+        self.restart_count = 0
+        self.MAX_RESTARTS = 3
         self.reset_for_new_session()
 
     # -- session lifecycle -------------------------------------------------
@@ -300,7 +304,7 @@ class AutomationState:
         brew counter starts from zero again).
         """
         with self.lock:
-            self.clicking = True             # red-target clicking allowed
+            self.prayer_active = True             # red-target clicking allowed
             self.empty_pouch = False         # (legacy flag, never set)
             self.no_dodgy = False            # dodgy necklace crumbled
             self.shadow_veil_active = True
@@ -312,24 +316,24 @@ class AutomationState:
             self.program_finished = False
             self.brew_counter = 0
             self.messages.clear()
-            self.recent.clear()
+            #self.recent.clear()
 
     # -- interruption ------------------------------------------------------
     def request_restart(self, why: str = "") -> None:
         with self.lock:
-            self._pending = "restart"
+            self.pending_actions = "restart"
         LOG.warning("restart requested %s", f"({why})" if why else "")
         self.interrupt.set()
 
     def request_kill(self, why: str = "") -> None:
         with self.lock:
-            self._pending = "kill"
+            self.pending_actions = "kill"
         LOG.warning("kill requested %s", f"({why})" if why else "")
         self.interrupt.set()
 
     def clear_interrupt(self) -> None:
         with self.lock:
-            self._pending = None
+            self.pending_actions = None
         self.interrupt.clear()
 
     def raise_if_interrupted(self) -> None:
@@ -337,7 +341,7 @@ class AutomationState:
         if not self.interrupt.is_set():
             return
         with self.lock:
-            pending = self._pending
+            pending = self.pending_actions
         if pending == "kill":
             raise KillRequested()
         raise RestartRequested()
@@ -351,17 +355,17 @@ class AutomationState:
         a second copy of the loot-full line' rule is the original's.
         """
         with self.lock:
-            self.recent.append(content)
-            full = config.DISCORD["messages"]["loot_full"]
-            if content == full and full in self.messages:
+            #self.recent.append(content)
+            # full = config.DISCORD["messages"]["invent_full"]
+            if config.DISCORD["messages"]["invent_full"] in self.messages: # reduce to full in self.messages
                 LOG.debug("already in mailbox: %s", content)
             else:
                 self.messages.append(content)
-
+    """
     def recent_count(self, content: str) -> int:
         with self.lock:
             return self.recent.count(content)
-
+    """
     def has_message(self, content: str) -> bool:
         with self.lock:
             return content in self.messages
@@ -395,7 +399,7 @@ class AutomationState:
                 "route": self.route_name,
                 "run": self.session_index,
                 "brew_counter": self.brew_counter,
-                "clicking": self.clicking,
+                "prayer_active": self.prayer_active,
                 "target_move": self.target_move,
                 "full_invent": self.full_invent,
                 "no_dodgy": self.no_dodgy,
@@ -694,11 +698,34 @@ class GameWindow:
 # ===========================================================================
 # 5b. Input
 # ===========================================================================
-# The three input libraries the original used are kept exactly as they were,
-# because for anti-cheat work *how* the events are injected matters:
-#   * `keyboard` : all key presses outside of a recorded route
-#   * `mouse`    : all human-like moves/clicks driven by the vision code
-#   * `pynput`   : playback of recorded routes (both mouse and keyboard)
+# HOW the bot presses things - the anti-cheat relevant part of this file.
+#
+# It used to call the `mouse`, `keyboard` and `pynput` packages directly.  All
+# three of them inject through user32 (`SendInput` / `mouse_event` /
+# `keybd_event` / `SetCursorPos`) on Windows, and win32k marks every event that
+# arrives that way as injected: a WH_MOUSE_LL / WH_KEYBOARD_LL hook in the game
+# client reads LLMHF_INJECTED (bit 0) - and LLMHF_LOWER_IL_INJECTED (bit 1)
+# when the bot runs at a lower integrity level than the hooking process - out
+# of MSLLHOOKSTRUCT.flags and knows the input was emulated.
+#
+# So the injection itself now lives behind `inputbackends`, which offers
+# transports that do NOT go through those APIs:
+#
+#     interception  a kernel filter driver on the mouse/keyboard class stacks;
+#                   the strokes enter the device stack, exactly where a real
+#                   device's data enters it                        [default]
+#     arduino       a real USB HID microcontroller driven over serial
+#     sendinput     the old, flagged path - fallback / test control only
+#
+# Everything above this line (the bezier path, the easing, the random draws,
+# the delays) is untouched: the movement profile is identical, only the last
+# mile changed.  See INPUT_INJECTION.md for the full write-up.
+#
+# The three libraries are still imported here, but only for *capture* - which
+# generates no input events and therefore sets no flags:
+#   * `keyboard` : the ESC panic key listener (keyboard.wait)
+#   * `pynput`   : the route recorder (main.py --record)
+#   * `mouse`    : kept for compatibility with older tooling/scripts
 
 def _optional_import(name: str):
     try:
@@ -742,29 +769,58 @@ class InputController:
     send input (target clicker, chat watchdog, Discord commands).
     """
 
-    def __init__(self, window: GameWindow, clock: Clock, mouse_cfg: dict = None):
+    def __init__(self, window: GameWindow, clock: Clock, mouse_cfg: dict = None,
+                 backend=None):
         self.window = window
         self.clock = clock
         self.cfg = mouse_cfg or config.MOUSE
         self.lock = threading.RLock()
-        self._mouse_ctrl = None
-        self._keyboard_ctrl = None
+        self._backend = backend
+        self._sink = None    # optional debug overlay feed; a strict no-op if None
+
+    # -- the transport -----------------------------------------------------
+    @property
+    def backend(self):
+        """The `inputbackends` transport, opened on first use.
+
+        It is a process-wide singleton: a session restart rebuilds this
+        controller, and re-opening the driver context (or re-enumerating a
+        serial port) every time would be slow and pointless.
+        """
+        if self._backend is None:
+            self._backend = inputbackends.get_backend()
+        return self._backend
+
+    def set_action_sink(self, sink) -> None:
+        """Give the debug overlay a callable to receive human-readable actions.
+
+        The sink is a one-way log: it never blocks or sleeps, never alters
+        timing/order, and when it is None (the normal, non-`--debug` case)
+        every _emit() below is a no-op, so the automation flow is unchanged.
+        """
+        self._sink = sink
+
+    def _emit(self, text: str) -> None:
+        if self._sink is not None and text:
+            try:
+                self._sink(text)
+            except Exception:                            # pragma: no cover
+                self._sink = None
 
     # -- keyboard ----------------------------------------------------------
-    def key_down(self, key: str) -> None:
-        self._require(keyboard_lib, "keyboard")
-        with self.lock:
-            keyboard_lib.press(key)
+    def key_down(self, key: str, source: str = "action") -> None:
+        self.backend.key_down(_keymap.canonical(key), source)
+        self._emit(f"key down '{key}'")
 
-    def key_up(self, key: str) -> None:
-        self._require(keyboard_lib, "keyboard")
-        with self.lock:
-            keyboard_lib.release(key)
+    def key_up(self, key: str, source: str = "action") -> None:
+        self.backend.key_up(_keymap.canonical(key), source)
+        self._emit(f"key up '{key}'")
 
     def tap(self, key: str, hold: str = None, after: str = None,
             note: str = "") -> None:
         """press -> wait DELAYS[hold] -> release -> wait DELAYS[after]."""
         LOG.info("key '%s'%s", key, f" ({note})" if note else "")
+        self._emit(f"tap '{key}'{f' ({note})' if note else ''}")
         with self.lock:
             self.key_down(key)
             try:
@@ -779,6 +835,7 @@ class InputController:
     def held_key(self, key: str):
         """`with input.held_key('shift'): ...` - guarantees the release."""
         self.key_down(key)
+        self._emit(f"hold '{key}'")
         try:
             yield
         finally:
@@ -786,24 +843,19 @@ class InputController:
 
     # -- mouse -------------------------------------------------------------
     def position(self) -> Tuple[int, int]:
-        self._require(mouse_lib, "mouse")
-        return mouse_lib.get_position()
+        """Where the pointer is (a query; it injects nothing)."""
+        return self.backend.get_position()
 
-    def move_and_click(self, cx: int, cy: int, jitter_px: int = None,
-                       click: bool = True) -> Tuple[int, int]:
-        """Human-like bezier move to a canvas point, then (optionally) click.
-
-        Port of the original `human_like_mouse_move_and_click`: same easing,
-        same number of samples, same random ranges drawn in the same order, so
-        the movement profile an anti-cheat would see is unchanged.  Only the
-        target is different - it is now clamped into the game canvas.
-        """
-        self._require(mouse_lib, "mouse")
+    def _bezier_to(self, cx: int, cy: int,
+                   jitter_px: int = None) -> Tuple[int, int]:
+        """Human-like bezier move to a canvas point; no click."""
+        backend = self.backend
         cfg = self.cfg
         jitter = cfg["jitter_px"] if jitter_px is None else jitter_px
 
+        self._emit(f"move -> {cx},{cy}")
         with self.lock:
-            start_x, start_y = mouse_lib.get_position()
+            start_x, start_y = backend.get_position()
             target_x, target_y = self.window.to_screen(cx, cy)
             target_x += random.randint(-jitter, jitter)
             target_y += random.randint(-jitter, jitter)
@@ -824,19 +876,54 @@ class InputController:
                                       cfg["bezier_intensity"])
                 # slower at the start and the end of the stroke
                 duration = sample_delay(cfg["step_duration"]) * (1 - abs(0.5 - eased))
-                mouse_lib.move(nx, ny, absolute=True, duration=duration)
+                backend.move(nx, ny, duration=duration)
 
-            mouse_lib.move(target_x, target_y, absolute=True,
-                           duration=sample_delay(cfg["final_duration"]))
-            if click:
-                mouse_lib.click()
+            backend.move(target_x, target_y,
+                         duration=sample_delay(cfg["final_duration"]))
         return target_x, target_y
+
+    def move_and_click(self, cx: int, cy: int, jitter_px: int = None,
+                       click: bool = True) -> Tuple[int, int]:
+        """Human-like bezier move to a canvas point, then (optionally) click.
+
+        Port of the original `human_like_mouse_move_and_click`: same easing,
+        same number of samples, same random ranges drawn in the same order, so
+        the movement profile an anti-cheat would see is unchanged.  Only the
+        target is different - it is now clamped into the game canvas - and the
+        events leave through `inputbackends` instead of user32.SendInput.
+        The click itself is `click_left`: a real press -> hold -> release.
+        """
+        target = self._bezier_to(cx, cy, jitter_px)
+        if click:
+            self.click_left()
+        return target
+
+    def move_to(self, cx: int, cy: int, jitter_px: int = None) -> Tuple[int, int]:
+        """Bezier move without clicking (used to track a moving target)."""
+        return self._bezier_to(cx, cy, jitter_px)
+
+    def mouse_down(self, button: str = "left", source: str = "action") -> None:
+        self.backend.mouse_down(button, source)
+
+    def mouse_up(self, button: str = "left", source: str = "action") -> None:
+        self.backend.mouse_up(button, source)
+
+    def click_left(self, hold: str = "mouse.click_hold") -> None:
+        """press -> wait DELAYS[hold] -> release; mirrors tap()'s structure.
+
+        Every bot-generated left click goes through here, so the button-down
+        time looks human instead of being an instantaneous down+up pair.
+        """
+        self._emit("click")
+        self.mouse_down()
+        try:
+            self.clock.wait(hold)
+        finally:                     # a kill/restart must not stick the button
+            self.mouse_up()
 
     def click_here(self) -> None:
         """Click wherever the cursor already is (the idle-clicking loop)."""
-        self._require(mouse_lib, "mouse")
-        with self.lock:
-            mouse_lib.click()
+        self.click_left()
 
     def click_region(self, region: Region, clicks: int = 1,
                      jitter_px: int = None) -> None:
@@ -857,6 +944,8 @@ class InputController:
 
         LOG.info("click %s at canvas (%d,%d)%s", region.name, click_x, click_y,
                  f" x{clicks}" if clicks > 1 else "")
+        self._emit(f"click {region.name} at {click_x},{click_y}"
+                   f"{' x%d' % clicks if clicks > 1 else ''}")
         self.move_and_click(click_x, click_y, jitter_px=jitter_px)
         for _ in range(clicks - 1):
             self.clock.sleep(sample_delay(self.cfg["extra_click_interval"]))
@@ -875,13 +964,7 @@ class InputController:
             LOG.warning("timeline is empty, nothing to replay")
             return 0
 
-        self._require(pynput_mouse, "pynput")
-        if self._mouse_ctrl is None:
-            self._mouse_ctrl = pynput_mouse.Controller()
-            self._keyboard_ctrl = pynput_keyboard.Controller()
-        mouse_ctrl = self._mouse_ctrl
-        keyboard_ctrl = self._keyboard_ctrl
-
+        backend = self.backend
         events = sorted(events, key=lambda e: e["timestamp"])
         first = events[0]["timestamp"]
         started = time.monotonic()
@@ -890,28 +973,45 @@ class InputController:
             self.clock.sleep_until(started + (event["timestamp"] - first))
             kind = event["type"]
 
+            # `source="replay"` tells the backend this came from a recorded
+            # route rather than from the vision code.  Hardware backends cannot
+            # tell the difference and ignore it; the legacy backend uses it to
+            # keep replaying through pynput exactly as it always did.
             if kind == "mouse_move":
-                mouse_ctrl.position = self._event_point(event, translate)
+                x, y = self._event_point(event, translate)
+                backend.move_to(x, y, source="replay")
+                cx, cy = self._canvas_point(event, translate)
+                self._emit(f"move -> {cx},{cy}")
             elif kind == "mouse_click":
-                button = getattr(pynput_mouse.Button, event["button"])
+                button = event["button"]
+                action = "down" if event["pressed"] else "up"
+                cx, cy = self._canvas_point(event, translate)
+                self._emit(f"{button} {action} at {cx},{cy}")
                 if event["pressed"]:
-                    mouse_ctrl.press(button)
+                    backend.mouse_down(button, source="replay")
                 else:
-                    mouse_ctrl.release(button)
+                    backend.mouse_up(button, source="replay")
             elif kind == "mouse_scroll":
-                mouse_ctrl.scroll(event["dx"], event["dy"])
+                backend.scroll(event["dx"], event["dy"], source="replay")
+                self._emit(f"scroll d{event['dx']},d{event['dy']}")
             elif kind in ("key_press", "key_release"):
-                key = event["key"]
-                key_obj = key if len(key) == 1 else getattr(
-                    pynput_keyboard.Key, key, key)
+                key = _keymap.canonical(event["key"])
+                self._emit(f"key {key} {kind.replace('key_', '')}")
                 if kind == "key_press":
-                    keyboard_ctrl.press(key_obj)
+                    backend.key_down(key, source="replay")
                 else:
-                    keyboard_ctrl.release(key_obj)
+                    backend.key_up(key, source="replay")
             else:
                 LOG.debug("ignoring unknown event type %r", kind)
 
         return len(events)
+
+    def _canvas_point(self, event: dict, translate: bool) -> Tuple[int, int]:
+        """The on-canvas location a recorded move/click lands on (for the feed)."""
+        if not translate:
+            return int(event["x"]), int(event["y"])
+        return self.window.to_canvas(*self.window.translate_recorded(
+            event["x"], event["y"]))
 
     def _event_point(self, event: dict, translate: bool) -> Tuple[int, int]:
         x, y = event["x"], event["y"]
@@ -925,6 +1025,7 @@ class InputController:
     # -- misc --------------------------------------------------------------
     @staticmethod
     def _require(module, name: str) -> None:
+        """Kept for the capture paths (--record) that still need a library."""
         if module is None:
             raise SessionError(
                 f"python module '{name}' is not installed - run "
@@ -936,7 +1037,7 @@ class InputController:
 # Panic key
 # ===========================================================================
 
-def start_panic_key_listener(state: AutomationState, timer: RuntimeTimer = None,
+def start_panic_key_listener(state: BotState, timer: RuntimeTimer = None,
                              key: str = None) -> None:
     """ESC anywhere on the desktop kills the process (legacy behaviour)."""
     key = key or config.GENERAL["panic_key"]

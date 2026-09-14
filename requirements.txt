@@ -9,8 +9,32 @@ opencv-python>=4.8            # connected components for the colour blob finders
 Pillow>=10.0                  # ImageGrab screen capture
 pytesseract>=0.3.10           # local OCR: chat watchdog + valuable drop label
 
-mouse>=0.7.1                  # human-like moves/clicks (vision driven actions)
-keyboard>=0.13.5              # key presses + the ESC panic key
-pynput>=1.7.6                 # recorded route playback / recording
+# ---------------------------------------------------------------------------
+# Input.  How events reach Windows is configured in config.INPUT and explained
+# in INPUT_INJECTION.md.  The default transport (the Interception kernel filter
+# driver) needs NO python package - only the driver itself plus interception.dll,
+# which is loaded with ctypes:
+#
+#     install-interception.exe /install      (elevated, then reboot)
+#
+# The three libraries below are still needed, but for *capture* and for the
+# legacy fallback transport:
+#   keyboard : the ESC panic key listener        (capture - sets no flags)
+#   pynput   : `main.py --record` route recorder (capture - sets no flags)
+#   mouse    : the legacy "sendinput" backend, which DOES set LLMHF_INJECTED
+#              and is only a fallback / the control case of test_input_flags.py
+# ---------------------------------------------------------------------------
+mouse>=0.7.1                  # legacy sendinput backend only
+keyboard>=0.13.5              # ESC panic key + legacy sendinput backend
+pynput>=1.7.6                 # route recording + legacy recorded-route playback
+
+# Only for the "arduino" backend (a real USB HID board - the transport with no
+# driver and no injection API at all).  Optional: the bot runs without it.
+pyserial>=3.5                 # optional: config.INPUT["backend"] == "arduino"
 
 discord.py>=2.3.0             # Discord control channel
+python-dotenv>=1.0.0          # loads secrets from .env (see .env.example)
+
+# AI agent (optional - only needed with --ai-agent)
+# openai>=1.0.0                # OpenAI API for GPT-4o stuck-state recovery
+google-genai>=1.0.0            # Google Gemini API for stuck-state recovery
